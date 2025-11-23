@@ -1,17 +1,595 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<title>Online Multiplayer Chess</title>
-<link rel="stylesheet" href="style.css">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Chess — 3D Wood (Multiplayer)</title>
+<style>
+  :root{
+    --light:#f6e6c5; --dark:#8b5a2b; --accent:#ffd166;
+    --bg:#1d1307; --panel:#24180b; --muted:#ccbfa6;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    background:radial-gradient(circle at 50% 20%,#2b1c0c 0%,#1a1006 100%);
+    color:#f6f3ee; font:14px/1.45 system-ui,Segoe UI,Roboto,Arial;
+    display:grid; place-items:center; min-height:100vh;
+  }
+  .wrap{max-width:1100px;width:100%;margin:0 auto;padding:0 16px;
+    display:grid;grid-template-columns:min(92vmin,660px) 320px;gap:20px;align-items:center;}
+  .board{width:min(92vmin,660px);aspect-ratio:1/1;border-radius:16px;overflow:hidden;position:relative;
+    background:linear-gradient(145deg,#714e29,#3f2712);
+    box-shadow:0 12px 40px rgba(0,0,0,.65), inset 0 4px 6px rgba(255,255,255,.25), inset 0 -4px 6px rgba(0,0,0,.4);
+    padding:24px;}
+  .board::before{content:"";position:absolute;inset:0;border-radius:16px;
+    background:radial-gradient(circle at 30% 30%,rgba(255,255,255,.15),transparent 70%);
+    pointer-events:none;}
+  .grid{display:grid;grid-template-columns:repeat(8,1fr);grid-template-rows:repeat(8,1fr);height:100%;
+    border-radius:8px;overflow:hidden;box-shadow:inset 0 0 10px rgba(0,0,0,.3);position:relative;}
+  .sq{position:relative;display:flex;align-items:center;justify-content:center;user-select:none;cursor:pointer;
+    font-size:calc(2.1rem + 1.2vmin);}
+  .light{background:var(--light);background-image:linear-gradient(135deg,rgba(255,255,255,.25),rgba(0,0,0,.08));}
+  .dark{background:var(--dark);background-image:linear-gradient(135deg,rgba(0,0,0,.35),rgba(255,255,255,.05));}
+  .sq::after{content:"";position:absolute;inset:0;box-shadow:inset 0 0 0 1px rgba(0,0,0,.1);}
+  .piece{filter:drop-shadow(0 3px 5px rgba(0,0,0,.5));}
+  .piece.w{color:#ffffff;text-shadow:0 0 4px rgba(0,0,0,.6);}
+  .piece.b{color:#000000;text-shadow:0 0 3px rgba(255,255,255,.3);}
+  .hl{outline:3px solid var(--accent);outline-offset:-3px;transform:scale(1.04);}
+  .last{box-shadow:inset 0 0 0 4px rgba(255,224,138,.8);}
+  .dot{position:absolute;width:34%;height:34%;border-radius:50%;background:rgba(0,0,0,.28);}
+  .dot.capture{width:78%;height:78%;border:4px solid rgba(0,0,0,.28);background:transparent;}
+  .side{background:linear-gradient(180deg,#2d1c0c,#1d1307);border:1px solid #4b2f15;border-radius:16px;padding:16px 14px 20px;
+    box-shadow:0 6px 24px rgba(0,0,0,.45);}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .row+.row{margin-top:10px}
+  button{background:#3d2813;border:1px solid #6d4a26;color:#f8f6f2;border-radius:10px;padding:8px 10px;cursor:pointer;
+    box-shadow:0 2px 4px rgba(0,0,0,.3);transition:background .15s;}
+  button:hover{background:#523418;}
+  .muted{color:var(--muted)}
+  .log{max-height:48vh;overflow:auto;background:#1a1106;border:1px solid #3a2410;border-radius:12px;padding:10px;
+    font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;color:#f0e3cc;}
+  .promo{position:fixed;inset:0;display:none;place-items:center;background:rgba(0,0,0,.55);z-index:999;}
+  .promo > div{background:#2b1a0a;border:1px solid #6a4823;border-radius:14px;padding:16px;display:flex;gap:8px}
+  .promo button{background:#4b3115;border:1px solid #7d5a2e;color:#f5f1e8}
+  .promo button:hover{background:#5a3a1a}
+</style>
 </head>
 <body>
 <div class="wrap">
-    <h1>Multiplayer Chess</h1>
-    <p id="status">Connecting...</p>
-    <div id="board" class="board"></div>
+  <div class="board"><div id="grid" class="grid" role="grid" aria-label="Chess board"></div></div>
+  <aside class="side">
+    <div class="row"><strong>Status:</strong> <span id="status" class="muted">Connecting to server…</span></div>
+    <div class="row">
+      <button id="flip">Flip</button>
+      <button id="undo">Undo (local)</button>
+      <button id="reset">Reset (local)</button>
+    </div>
+    <div class="row"><strong>Moves:</strong></div>
+    <pre id="log" class="log"></pre>
+    <div class="row muted">You can move only your own color, on your turn.</div>
+  </aside>
 </div>
-<script src="board.js"></script>
-<script src="chess.js"></script>
+
+<script>
+/* ======= ENGINE (full rules + custom castling from d-file) ======= */
+(function(global){
+  const FILES='abcdefgh';
+  const fIdx=c=>c.charCodeAt(0)-97, rIdx=n=>parseInt(n,10)-1;
+  const sq=(f,r)=>FILES[f]+(r+1);
+  const inb=(f,r)=>f>=0&&f<8&&r>=0&&r<8;
+  const deep=x=>JSON.parse(JSON.stringify(x));
+
+  function Chess(){ this.reset(); }
+
+  Chess.prototype.reset=function(){
+    // Custom back ranks: White King d1, Queen e1; Black King d8, Queen e8
+    const backW=[{t:'r',c:'w'},{t:'n',c:'w'},{t:'b',c:'w'},{t:'k',c:'w'},{t:'q',c:'w'},{t:'b',c:'w'},{t:'n',c:'w'},{t:'r',c:'w'}];
+    const backB=[{t:'r',c:'b'},{t:'n',c:'b'},{t:'b',c:'b'},{t:'k',c:'b'},{t:'q',c:'b'},{t:'b',c:'b'},{t:'n',c:'b'},{t:'r',c:'b'}];
+    const paw=c=>Array.from({length:8},()=>({t:'p',c}));
+    this.b=[ backW, paw('w'), Array(8).fill(null), Array(8).fill(null),
+             Array(8).fill(null), Array(8).fill(null), paw('b'), backB ];
+    this.turn='w';
+    this.castle={K:true,Q:true,k:true,q:true};
+    this.ep=null;
+    this.half=0; this.full=1;
+    this.hst=[];
+  };
+
+  Chess.prototype._opp=c=>c==='w'?'b':'w';
+  Chess.prototype.board=function(){return deep(this.b);};
+  Chess.prototype.get=function(S){return this.b[rIdx(S[1])][fIdx(S[0])];};
+  Chess.prototype.set=function(S,p){this.b[rIdx(S[1])][fIdx(S[0])]=p;};
+  Chess.prototype.kingSq=function(c){
+    for(let r=0;r<8;r++)for(let f=0;f<8;f++){const p=this.b[r][f];if(p&&p.t==='k'&&p.c===c)return sq(f,r);}
+    return null;
+  };
+
+  Chess.prototype._push=function(A,from,to,opt={}){A.push({from,to,...opt});};
+
+  Chess.prototype._slide=function(A,f,r,df,dr,c){
+    let F=f+df,R=r+dr;
+    while(inb(F,R)){
+      const P=this.b[R][F];
+      if(!P) this._push(A, sq(f,r), sq(F,R));
+      else { if(P.c!==c) this._push(A, sq(f,r), sq(F,R), {capture:true}); break; }
+      F+=df; R+=dr;
+    }
+  };
+
+  Chess.prototype.isAttacked=function(S,byColor){
+    return this._pseudo(byColor,true).some(m=>m.to===S);
+  };
+  Chess.prototype.inCheck=function(c){return this.isAttacked(this.kingSq(c||this.turn), this._opp(c||this.turn));};
+
+  Chess.prototype._pseudo=function(color, atk=false){
+    const A=[];
+    for(let r=0;r<8;r++)for(let f=0;f<8;f++){
+      const P=this.b[r][f]; if(!P||P.c!==color) continue;
+      const FROM=sq(f,r);
+
+      if(P.t==='p'){
+        const dir=color==='w'?1:-1, r1=r+dir;
+        if(!atk){
+          if(inb(f,r1) && !this.b[r1][f]){
+            if(r1===7||r1===0){ for(const pr of['q','r','b','n']) this._push(A,FROM,sq(f,r1),{promo:pr}); }
+            else this._push(A,FROM,sq(f,r1));
+            const start=color==='w'?1:6, r2=r+2*dir;
+            if(r===start && !this.b[r2]?.[f]) this._push(A,FROM,sq(f,r2),{dp:true});
+          }
+        }
+        for(const df of[-1,1]){
+          const F=f+df,R=r+dir; if(!inb(F,R)) continue;
+          const T=this.b[R][F];
+          if(T && T.c!==color){
+            if(R===7||R===0){ for(const pr of['q','r','b','n']) this._push(A,FROM,sq(F,R),{capture:true,promo:pr}); }
+            else this._push(A,FROM,sq(F,R),{capture:true});
+          }
+        }
+        if(this.ep && !atk){
+          const eF=fIdx(this.ep[0]), eR=rIdx(this.ep[1]);
+          if(eR===r+dir && Math.abs(eF-f)===1) this._push(A,FROM,sq(eF,eR),{enPassant:true,capture:true});
+        }
+      }
+
+      else if(P.t==='n'){
+        for(const [df,dr] of [[1,2],[2,1],[-1,2],[-2,1],[1,-2],[2,-1],[-1,-2],[-2,-1]]){
+          const F=f+df,R=r+dr; if(!inb(F,R)) continue;
+          const T=this.b[R][F]; if(!T) this._push(A,FROM,sq(F,R)); else if(T.c!==color) this._push(A,FROM,sq(F,R),{capture:true});
+        }
+      }
+
+      else if(P.t==='b'){
+        this._slide(A,f,r,1,1,color); this._slide(A,f,r,1,-1,color);
+        this._slide(A,f,r,-1,1,color); this._slide(A,f,r,-1,-1,color);
+      }
+
+      else if(P.t==='r'){
+        this._slide(A,f,r,1,0,color); this._slide(A,f,r,-1,0,color);
+        this._slide(A,f,r,0,1,color); this._slide(A,f,r,0,-1,color);
+      }
+
+      else if(P.t==='q'){
+        for(const [df,dr] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]])
+          this._slide(A,f,r,df,dr,color);
+      }
+
+      else if(P.t==='k'){
+        for(const df of[-1,0,1])for(const dr of[-1,0,1]){
+          if(!df&&!dr) continue;
+          const F=f+df,R=r+dr; if(!inb(F,R)) continue;
+          const T=this.b[R][F]; if(!T) this._push(A,FROM,sq(F,R)); else if(T.c!==color) this._push(A,FROM,sq(F,R),{capture:true});
+        }
+
+        if(!atk){
+          const homeR = (color==='w'?0:7);
+          const kingF = 3;
+          if(r===homeR && f===kingF && !this.inCheck(color)){
+            if((color==='w'?this.castle.K:this.castle.k)){
+              const empty = !this.b[homeR][4] && !this.b[homeR][5];
+              const rook = this.b[homeR][7];
+              if(empty && rook && rook.t==='r' && rook.c===color){
+                const pass1=sq(4,homeR), pass2=sq(5,homeR);
+                if(!this.isAttacked(pass1,this._opp(color)) && !this.isAttacked(pass2,this._opp(color)))
+                  this._push(A,FROM,sq(5,homeR),{castle:(color==='w'?'K':'k')});
+              }
+            }
+            if((color==='w'?this.castle.Q:this.castle.q)){
+              const empty = !this.b[homeR][2] && !this.b[homeR][1];
+              const rook = this.b[homeR][0];
+              if(empty && rook && rook.t==='r' && rook.c===color){
+                const pass1=sq(2,homeR), pass2=sq(1,homeR);
+                if(!this.isAttacked(pass1,this._opp(color)) && !this.isAttacked(pass2,this._opp(color)))
+                  this._push(A,FROM,sq(1,homeR),{castle:(color==='w'?'Q':'q')});
+              }
+            }
+          }
+        }
+      }
+    }
+    return A;
+  };
+
+  Chess.prototype._makeRaw=function(m){
+    const u={m, epPrev:this.ep, castlePrev:deep(this.castle)};
+    this.ep=null;
+
+    const f=fIdx(m.from[0]), r=rIdx(m.from[1]);
+    const F=fIdx(m.to[0])  , R=rIdx(m.to[1]);
+    const P=this.b[r][f];
+
+    const revokeOnMove=(p,fromF,fromR)=>{
+      if(p.t==='k'){
+        if(p.c==='w'){ this.castle.K=false; this.castle.Q=false; }
+        else         { this.castle.k=false; this.castle.q=false; }
+      }
+      if(p.t==='r' && fromR===0){
+        if(fromF===0) this.castle.Q=false;
+        if(fromF===7) this.castle.K=false;
+      }
+      if(p.t==='r' && fromR===7){
+        if(fromF===0) this.castle.q=false;
+        if(fromF===7) this.castle.k=false;
+      }
+    };
+
+    u.castleMove = null;
+
+    if(P.t==='p' && Math.abs(R-r)===2) this.ep = sq(f,(r+R)/2);
+
+    if(m.enPassant){
+      const capR = R + (P.c==='w'?-1:1);
+      u.cap = this.b[capR][F];
+      this.b[capR][F] = null;
+    } else {
+      u.cap = this.b[R][F];
+    }
+
+    this.b[R][F] = { t:(m.promo?m.promo:P.t), c:P.c };
+    this.b[r][f] = null;
+
+    if(m.castle==='K' || m.castle==='k'){
+      const rookFrom = sq(7,R), rookTo = sq(4,R);
+      u.castleMove = {from:rookFrom,to:rookTo, piece:this.get(rookFrom)};
+      this.set(rookTo, this.get(rookFrom));
+      this.set(rookFrom, null);
+    }
+    if(m.castle==='Q' || m.castle==='q'){
+      const rookFrom = sq(0,R), rookTo = sq(2,R);
+      u.castleMove = {from:rookFrom,to:rookTo, piece:this.get(rookFrom)};
+      this.set(rookTo, this.get(rookFrom));
+      this.set(rookFrom, null);
+    }
+
+    revokeOnMove(P,f,r);
+
+    if(u.cap){
+      if(R===0 && F===0 && u.cap.t==='r' && u.cap.c==='w') this.castle.Q=false;
+      if(R===0 && F===7 && u.cap.t==='r' && u.cap.c==='w') this.castle.K=false;
+      if(R===7 && F===0 && u.cap.t==='r' && u.cap.c==='b') this.castle.q=false;
+      if(R===7 && F===7 && u.cap.t==='r' && u.cap.c==='b') this.castle.k=false;
+    }
+
+    this.turn = this._opp(this.turn);
+    return u;
+  };
+
+  Chess.prototype._unmakeRaw=function(u){
+    this.turn = this._opp(this.turn);
+    this.ep = u.epPrev; this.castle = u.castlePrev;
+
+    const m=u.m;
+    const f=fIdx(m.from[0]), r=rIdx(m.from[1]);
+    const F=fIdx(m.to[0])  , R=rIdx(m.to[1]);
+    const P=this.b[R][F];
+
+    if(u.castleMove){
+      this.set(u.castleMove.from, u.castleMove.piece);
+      this.set(u.castleMove.to, null);
+    }
+
+    this.b[r][f] = { t:(m.promo?'p':P.t), c:P.c };
+    this.b[R][F] = null;
+
+    if(m.enPassant){
+      const capR = R + (P.c==='w'?-1:1);
+      this.b[capR][F] = u.cap;
+    } else if(u.cap){
+      this.b[R][F] = u.cap;
+    }
+  };
+
+  Chess.prototype._legal=function(color){
+    const all=this._pseudo(color);
+    const out=[];
+    for(const m of all){
+      const u=this._makeRaw(m);
+      if(!this.inCheck(this._opp(this.turn))) out.push(m);
+      this._unmakeRaw(u);
+    }
+    return out;
+  };
+
+  Chess.prototype.moves=function(opt={}){
+    const c=opt.color||this.turn;
+    const L=this._legal(c);
+    return opt.square ? L.filter(m=>m.from===opt.square) : L;
+  };
+
+  Chess.prototype.move=function(m){
+    const L=this._legal(this.turn).find(x=>x.from===m.from && x.to===m.to && ((x.promo||'')===(m.promo||'')));
+    if(!L) return null;
+    const u=this._makeRaw(L);
+    this.hst.push({m:L,undo:u});
+    return L;
+  };
+
+  Chess.prototype.undo=function(){
+    const h=this.hst.pop(); if(!h) return null;
+    this._unmakeRaw(h.undo); return h.m;
+  };
+
+  Chess.prototype.isCheckmate=function(){ return this.inCheck(this.turn) && this._legal(this.turn).length===0; };
+  Chess.prototype.isStalemate=function(){ return !this.inCheck(this.turn) && this._legal(this.turn).length===0; };
+  Chess.prototype.isInsufficient=function(){
+    const pcs=[]; for(let r=0;r<8;r++)for(let f=0;f<8;f++){const p=this.b[r][f]; if(p) pcs.push(p); }
+    const majors=pcs.filter(p=>p.t==='q'||p.t==='r'||p.t==='p'); if(majors.length>0) return false;
+    const B=pcs.filter(p=>p.t==='b').length, N=pcs.filter(p=>p.t==='n').length;
+    if(B===0 && N===0 && pcs.length===2) return true;
+    if(B===1 && N===0 && pcs.length===3) return true;
+    if(B===0 && N===1 && pcs.length===3) return true;
+    return false;
+  };
+  Chess.prototype.isGameOver=function(){ return this.isCheckmate() || this.isStalemate() || this.isInsufficient(); };
+
+  global.OfflineChess=Chess;
+})(window);
+
+/* ======= UI + MULTIPLAYER (WebSocket) ======= */
+(() => {
+  const grid = document.getElementById('grid');
+  const statusEl = document.getElementById('status');
+  const logEl = document.getElementById('log');
+  const btnFlip = document.getElementById('flip');
+  const btnUndo = document.getElementById('undo');
+  const btnReset = document.getElementById('reset');
+
+  const glyph = { p:'♟', r:'♜', n:'♞', b:'♝', q:'♛', k:'♚',
+                  P:'♙', R:'♖', N:'♘', B:'♗', Q:'♕', K:'♔' };
+  const files='abcdefgh';
+  const alg = (f,r)=>files[f]+(r+1);
+
+  let game = new OfflineChess();
+  let selected = null;
+  let lastMove = null;
+  let orient = 'white';
+
+  // Multiplayer vars
+  let socket = null;
+  let myColor = null; // "white" or "black"
+
+  // Promotion chooser
+  const promo=document.createElement('div');
+  promo.className='promo';
+  promo.innerHTML=`
+    <div>
+      <button data-p="q">♛ Queen</button>
+      <button data-p="r">♜ Rook</button>
+      <button data-p="b">♝ Bishop</button>
+      <button data-p="n">♞ Knight</button>
+    </div>`;
+  document.body.appendChild(promo);
+
+  function showPromo(from,to){
+    promo.style.display='grid';
+    const pick=(e)=>{
+      const p=e.target.getAttribute('data-p'); if(!p) return;
+      promo.style.display='none'; promo.removeEventListener('click',pick);
+      doMove({from,to,promo:p}, true);
+      selected=null;
+    };
+    promo.addEventListener('click',pick);
+  }
+
+  function render(){
+    grid.innerHTML='';
+    const b=game.board();
+    const rOrder = orient==='white' ? [0,1,2,3,4,5,6,7] : [7,6,5,4,3,2,1,0];
+    const fOrder = orient==='white' ? [0,1,2,3,4,5,6,7] : [7,6,5,4,3,2,1,0];
+
+    for(const r of rOrder){
+      for(const f of fOrder){
+        const d=document.createElement('div');
+        const name=alg(f,r);
+        d.className='sq ' + (((f+r)%2===0)?'light':'dark');
+        d.dataset.square=name;
+
+        if(lastMove && (lastMove.from===name || lastMove.to===name)) d.classList.add('last');
+
+        const cell=b[r][f];
+        if(cell){
+          const s=document.createElement('span');
+          s.className='piece ' + (cell.c==='w' ? 'w' : 'b');
+          const key=(cell.c==='w')?cell.t.toUpperCase():cell.t.toLowerCase();
+          s.textContent=glyph[key];
+          d.appendChild(s);
+        }
+
+        d.addEventListener('click', ()=>onSquare(name));
+        grid.appendChild(d);
+      }
+    }
+
+    if(selected){
+      const moves=game.moves({square:selected});
+      [...grid.children].forEach(el=>{ if(el.dataset.square===selected) el.classList.add('hl'); });
+      for(const m of moves){
+        const el=[...grid.children].find(e=>e.dataset.square===m.to);
+        if(!el) continue;
+        const spot=document.createElement('div');
+        spot.className='dot' + (m.capture ? ' capture' : '');
+        el.appendChild(spot);
+      }
+    }
+
+    sync();
+  }
+
+  function onSquare(sq){
+    // must be connected & paired
+    if(!myColor){
+      statusEl.textContent='Connected. Waiting for opponent...';
+      return;
+    }
+    const myTurnColor = (myColor === 'white' ? 'w' : 'b');
+    if(game.turn !== myTurnColor){
+      // Not your turn
+      return;
+    }
+
+    const p=game.get(sq);
+    if(!selected){
+      if(!p) return;
+      if(p.c!==myTurnColor) return; // can't select opponent piece
+      selected=sq; render(); return;
+    }
+    if(selected===sq){ selected=null; render(); return; }
+
+    const legal = game.moves({square:selected}).find(m=>m.to===sq);
+    if(!legal){ selected=null; render(); return; }
+
+    const destRank = parseInt(sq[1],10);
+    const moving = game.get(selected);
+    if(moving && moving.t==='p' && (destRank===8 || destRank===1)){
+      showPromo(selected,sq);
+      return;
+    }
+
+    doMove({from:selected,to:sq}, true);
+    selected=null;
+  }
+
+  function doMove(m, sendToServer){
+    const res=game.move(m);
+    if(!res){
+      sync(); render(); return;
+    }
+    lastMove={from:res.from,to:res.to};
+    pushLog(res);
+    sync(); render();
+
+    if(sendToServer && socket && socket.readyState===WebSocket.OPEN){
+      const payload = { type:'move', move:{
+        from: res.from,
+        to: res.to,
+        promo: res.promo || m.promo || null
+      }};
+      socket.send(JSON.stringify(payload));
+    }
+  }
+
+  function applyRemoteMove(m){
+    // m: {from, to, promo?}
+    const moveObj = { from:m.from, to:m.to };
+    if(m.promo) moveObj.promo = m.promo;
+    const res = game.move(moveObj);
+    if(!res){
+      sync(); render(); return;
+    }
+    lastMove={from:res.from,to:res.to};
+    pushLog(res);
+    sync(); render();
+  }
+
+  function pushLog(m){
+    let t='';
+    if(m.castle==='K'||m.castle==='k') t='O-O';
+    else if(m.castle==='Q'||m.castle==='q') t='O-O-O';
+    else t=m.from+(m.capture?'x':'-')+m.to+(m.promo?('='+m.promo.toUpperCase()):'');
+    if(game.isCheckmate()) t+='#';
+    else if(game.inCheck()) t+='+';    
+    logEl.textContent += (logEl.textContent.trim()?'\n':'')+t;
+    logEl.scrollTop=logEl.scrollHeight;
+  }
+
+  function sync(){
+    if(game.isGameOver()){
+      if(game.isCheckmate()) statusEl.textContent='Checkmate';
+      else if(game.isStalemate()) statusEl.textContent='Stalemate';
+      else if(game.isInsufficient()) statusEl.textContent='Draw · insufficient material';
+      else statusEl.textContent='Game over';
+    } else if(game.inCheck()){
+      statusEl.textContent=(game.turn==='w'?'White':'Black')+' to move — Check!';
+    } else {
+      if(!myColor){
+        statusEl.textContent=(game.turn==='w'?'White':'Black')+' to move (waiting for pairing…)';
+      } else {
+        const mine = (myColor==='white'?'White':'Black');
+        const turnSide = (game.turn==='w'?'White':'Black');
+        if(mine===turnSide) statusEl.textContent=`You are ${mine.toUpperCase()} — your move.`;
+        else statusEl.textContent=`You are ${mine.toUpperCase()} — waiting for opponent…`;
+      }
+    }
+  }
+
+  // Controls (these are LOCAL ONLY, don't sync)
+  btnFlip.addEventListener('click', ()=>{ orient=(orient==='white')?'black':'white'; render(); });
+  btnUndo.addEventListener('click', ()=>{
+    const u=game.undo();
+    if(u){ lastMove=null; logEl.textContent=logEl.textContent.split('\n').slice(0,-1).join('\n'); }
+    sync(); render();
+  });
+  btnReset.addEventListener('click', ()=>{
+    game.reset(); selected=null; lastMove=null; logEl.textContent='';
+    sync(); render();
+  });
+
+  // WebSocket setup
+  const wsUrl =
+    (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+  socket = new WebSocket(wsUrl);
+
+  socket.addEventListener('open', () => {
+    statusEl.textContent='Connected to server — waiting to be paired…';
+  });
+
+  socket.addEventListener('message', (event) => {
+    let data;
+    try { data = JSON.parse(event.data); } catch(e){ return; }
+
+    if(data.type === 'start'){
+      myColor = data.color; // "white" or "black"
+      orient = (myColor === 'white') ? 'white' : 'black';
+      logEl.textContent = '';
+      game.reset();
+      selected=null; lastMove=null;
+      sync(); render();
+      statusEl.textContent = `You are ${myColor.toUpperCase()}. ` +
+        (myColor==='white' ? 'Your move.' : 'Waiting for opponent…');
+    }
+    else if(data.type === 'move' && data.move){
+      applyRemoteMove(data.move);
+    }
+    else if(data.type === 'opponent_left'){
+      statusEl.textContent = 'Opponent left. Refresh the page to find a new game.';
+    }
+    else if(data.type === 'status' && data.msg){
+      statusEl.textContent = data.msg;
+    }
+  });
+
+  socket.addEventListener('close', () => {
+    if(!myColor) statusEl.textContent='Disconnected from server.';
+    else statusEl.textContent='Connection lost. Game stopped.';
+  });
+
+  socket.addEventListener('error', () => {
+    statusEl.textContent='WebSocket error.';
+  });
+
+  // init
+  sync(); render();
+})();
+</script>
 </body>
 </html>
